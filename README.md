@@ -1,32 +1,40 @@
-# GitHub Builder Passport
+# Primus OKX KYC Credential
 
-A mobile-friendly GitHub credential passport powered by the official Primus BNB ZKID SDK. A credential is marked verified only when the SDK returns `on_chain_attested`.
+A mobile-friendly OKX KYC credential app powered by the official Primus BNB ZKID SDK. The app only displays a KYC level after the SDK returns `on_chain_attested` and the app successfully reads the matching KYC field from the BNB Smart Chain testnet demo registry.
 
 ## Current implementation
 
-- MetaMask wallet address connection (no signing request and no private key handling).
+- MetaMask wallet address connection; no wallet signature or private key handling.
 - Primus BNB ZKID SDK initialization.
-- Live GitHub provider and identity-property discovery from Primus Gateway configuration.
-- Re-checks the selected GitHub property immediately before proving; no guessed property ID is submitted.
-- Primus proof progress, failure handling and on-chain attestation reference.
-- Optional read of the GitHub identity payload from the published BNB Smart Chain testnet demo registry.
-- Shareable passport URL with selective inclusion of decoded fields and an optional wallet address.
-- Shared passports query Primus by proof request ID and compare provider/property. If profile fields are shared, recipients also re-read the registry and compare the included values before the page displays a verified badge.
+- Live OKX provider and identity-property discovery from Primus Gateway configuration.
+- Re-checks the selected OKX property immediately before proving; no guessed property ID is submitted.
+- Primus proof progress, failure diagnostics and on-chain attestation reference.
+- Optional read of the OKX KYC-level field from the published BNB Smart Chain testnet demo registry.
+- Shareable OKX KYC credential URL; the share page checks the proof reference with Primus and re-reads the KYC field from the registry before showing it as verified.
+- The app displays and shares only the KYC level. It does not display or place the six-month trade-history value in the share link.
+
+## Important property limitation
+
+Primus's published BNB ZKID demo currently exposes one OKX identity property described as **OKX KYC + trade count**. The official decoder expects a composite payload containing `kycLevel` and `tradeHistoryLast6Months`.
+
+This application displays and selectively shares only `kycLevel`, but the underlying Primus identity property and on-chain attestation are still the combined property. This is **not** a separate KYC-only cryptographic template. A genuinely KYC-only proof requires Primus to publish and enable a separate KYC-only identity property/template.
 
 ## Run locally
 
-Requirements: Node.js 20+, npm, MetaMask, and the Primus browser extension.
+Requirements: Node.js 20+, npm, MetaMask, an OKX account, and the Primus browser extension.
 
 1. Install the Primus extension: https://chromewebstore.google.com/detail/primus/oeiomhmbaapihbilkfkhmlajkeegnjhe
-2. Sign in to GitHub in the same browser profile that has the extension enabled.
+2. Sign in to OKX in the same browser profile that has the extension enabled.
 3. From the repository root, run:
 
     npm install
     npm run dev
 
 4. Open the Vite URL (normally http://localhost:5173).
-5. Connect MetaMask, discover live GitHub properties, select one, then run verification.
-6. Approve the Primus extension verification flow.
+5. Connect MetaMask, discover the live OKX property, then run verification.
+6. Complete the Primus extension flow on the OKX source tab.
+
+Never enter an OKX password, API key, secret or verification code into this application.
 
 ## App ID
 
@@ -34,45 +42,31 @@ The app uses the public example App ID from Primus's own BNB ZKID SDK demo as a 
 
 `0x36013DD48B0C1FBFE8906C0AF0CE521DDA69186AB6E6B5017DBF9691F9CF8E5C`
 
-Set `VITE_PRIMUS_APP_ID` in a local `.env` file to use an App ID registered for your own project. App IDs are public identifiers; do not place an App Secret, GitHub token, cookie, password or wallet private key in a Vite environment variable.
+Set `VITE_PRIMUS_APP_ID` in a local `.env` file to use an App ID registered for your own project. App IDs are public identifiers; do not put an App Secret, OKX password, API key, secret, cookie or wallet private key in a Vite environment variable.
 
-The live provider list is authoritative. If the configured App ID does not expose a GitHub property, the app stops rather than falling back to a hard-coded property.
+The live provider list is authoritative. If the configured App ID does not expose an OKX identity property, the app stops rather than falling back to a hard-coded property.
 
 ## Proof and claim boundaries
 
-- The app does not use GitHub OAuth, the GitHub REST API, scraping, or user-entered GitHub credentials to create verified claims.
-- The browser's GitHub session is used only inside the official Primus extension/source-verification flow.
+- The app does not use OKX API keys, private APIs, scraping, or user-entered account credentials to create verified claims.
+- The browser's OKX session is used only inside the official Primus extension/source-verification flow.
 - The app calls `BnbZkIdClient.init()` and `BnbZkIdClient.prove()` from `@primuslabs/bnb-zkid-sdk`.
-- A result is eligible for the passport only when the SDK returns `status: "on_chain_attested"`.
-- The app does not submit a guessed property ID. It discovers available GitHub property IDs from the live provider configuration and rechecks them immediately before proof generation.
-- Numeric GitHub profile fields are shown only when the associated registry payload is successfully read and decoded using the GitHub profile schema demonstrated by Primus's official SDK demo.
-- If the SDK attests but the app cannot read or decode the registry data, the attestation reference is still shown, but no invented numbers are displayed.
-- Shared passport pages call `queryProofResult()` and compare the actual Primus result to the shared provider and property. Included profile values are checked against a fresh testnet registry read. A client-side URL payload alone is never treated as proof.
-- Shared passport verification requires the Primus extension because the SDK initialization checks for it.
-- The share URL is a presentation/transport format, not a standalone cryptographic verifier. Recipients should check the proof reference with Primus before relying on the claims.
-
-## OKX diagnostic test
-
-The application includes a separate **OKX proof diagnostic** alongside the GitHub Builder Passport.
-
-- It calls the live Primus BNB ZKID SDK configuration and only offers an OKX property if Primus returns it.
-- The recognised canonical OKX KYC + trade-count identity property is `0x289d4fed0b3ecb26e711e6d1200b46f1d67f2da4847b03f99aa8584706933195`, as listed in the official Primus BNB ZKID demo decoder.
-- The test uses `client.prove()` with the live property ID and the connected EVM wallet address. It does not add a `jumpToUrl`; the official demo's regular OKX flow does not use one.
-- A result is considered successful only when the SDK returns `status: "on_chain_attested"`.
-- This is an integration diagnostic only. It does not decode OKX registry claims, create an OKX credential, or issue/share an OKX passport. A successful OKX test does not prove the GitHub template works.
-- Sign in to OKX in the same browser profile before starting. Never enter an OKX password, API key, secret or verification code into this app.
-
-The property is selected from the live Primus response; the canonical identifier above is used only to recognise the property, never as a substitute for a property missing from the live configuration.
+- A result is eligible for the credential only when the SDK returns `status: "on_chain_attested"`.
+- The app discovers the OKX identity-property ID from live Primus configuration and rechecks it immediately before proof generation.
+- The KYC level is shown only when the associated registry payload is successfully read and decoded using the OKX schema in Primus's official demo.
+- The six-month trade-history value is not displayed or included in the share URL. However, it remains part of the underlying composite identity-property attestation and registry payload.
+- Shared credential pages call `queryProofResult()`, compare the provider/property, and re-read the KYC field from the registry before displaying the verified badge.
+- The share URL is a presentation/transport format, not a standalone cryptographic verifier. Recipients should check the proof reference with Primus before relying on the claim.
 
 ## Registry read
 
-The initial decoder follows the public Primus demo's BNB Smart Chain testnet registry example:
+The decoder follows the public Primus demo's BNB Smart Chain testnet registry example:
 
 - Chain: BNB Smart Chain testnet (chain ID 97)
 - Registry: `0x9569299A8877Bc155232cF5Aa50AF42F9Fc32C7C`
-- GitHub identity property: `github_account_age`, mapped to the profile property identifier used in the official demo.
+- OKX identity property: `0x289d4fed0b3ecb26e711e6d1200b46f1d67f2da4847b03f99aa8584706933195`
 
-The testnet registry reader is deliberately isolated in `src/verification.ts`. Before production, confirm the production chain, registry address, provider/property identifiers and exact payload schema with Primus. Do not relabel testnet registry reads as mainnet verification.
+Before production, confirm the production chain, registry address, provider/property identifiers and exact payload schema with Primus. Do not label testnet registry reads as mainnet verification.
 
 ## Commands
 
@@ -83,10 +77,10 @@ The testnet registry reader is deliberately isolated in `src/verification.ts`. B
 
 - BNB ZKID SDK: https://github.com/primus-labs/BNB-ZKID-SDK
 - Official BNB ZKID SDK demo: https://github.com/primus-labs/BNB-ZKID-SDK-Demo
+- OKX property decoder: https://github.com/primus-labs/BNB-ZKID-SDK-Demo/blob/main/src/decode-attestation.ts
 - Primus Developer Hub: https://dev.primuslabs.xyz/
 - Primus extension: https://chromewebstore.google.com/detail/primus/oeiomhmbaapihbilkfkhmlajkeegnjhe
-- Continuum (design inspiration only; not used as a proof source): https://github.com/tomoima525/continuum
 
 ## Not included
 
-This is a first functional integration slice, not a production launch. It does not yet mint NFTs, store public profiles on a backend, run a separate custom Merkle/Semaphore circuit, or claim repository ownership/contribution metrics beyond data explicitly contained in the Primus attestation payload.
+This is a development integration, not a production launch. It does not mint NFTs or claim any financial standing, account balance, trading performance, or other OKX attributes outside the KYC level decoded from the Primus registry.
