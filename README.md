@@ -51,6 +51,19 @@ The live provider list is authoritative. If the configured App ID does not expos
 - Shared passport verification requires the Primus extension because the SDK initialization checks for it.
 - The share URL is a presentation/transport format, not a standalone cryptographic verifier. Recipients should check the proof reference with Primus before relying on the claims.
 
+## OKX diagnostic test
+
+The application includes a separate **OKX proof diagnostic** alongside the GitHub Builder Passport.
+
+- It calls the live Primus BNB ZKID SDK configuration and only offers an OKX property if Primus returns it.
+- The recognised canonical OKX KYC + trade-count identity property is `0x289d4fed0b3ecb26e711e6d1200b46f1d67f2da4847b03f99aa8584706933195`, as listed in the official Primus BNB ZKID demo decoder.
+- The test uses `client.prove()` with the live property ID and the connected EVM wallet address. It does not add a `jumpToUrl`; the official demo's regular OKX flow does not use one.
+- A result is considered successful only when the SDK returns `status: "on_chain_attested"`.
+- This is an integration diagnostic only. It does not decode OKX registry claims, create an OKX credential, or issue/share an OKX passport. A successful OKX test does not prove the GitHub template works.
+- Sign in to OKX in the same browser profile before starting. Never enter an OKX password, API key, secret or verification code into this app.
+
+The property is selected from the live Primus response; the canonical identifier above is used only to recognise the property, never as a substitute for a property missing from the live configuration.
+
 ## Registry read
 
 The initial decoder follows the public Primus demo's BNB Smart Chain testnet registry example:
