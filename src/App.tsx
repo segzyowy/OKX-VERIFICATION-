@@ -246,6 +246,15 @@ export default function App() {
   const [profile, setProfile] = useState<GithubAttestedProfile | null>(null);
   const [profileWarning, setProfileWarning] = useState("");
   const [error, setError] = useState("");
+  const [proofDiagnostic, setProofDiagnostic] = useState<{
+    clientRequestId: string;
+    providerId: string;
+    identityPropertyId: string;
+    progress: string[];
+    errorCode?: string;
+    sdkClientRequestId?: string;
+    proofRequestId?: string;
+  } | null>(null);
   const [includeProfile, setIncludeProfile] = useState(true);
   const [includeWallet, setIncludeWallet] = useState(false);
   const [shareMessage, setShareMessage] = useState("");
@@ -324,6 +333,14 @@ export default function App() {
     setRunning(true);
     setStatus("initializing");
 
+    const clientRequestId = "github-builder-passport-" + Date.now();
+    setProofDiagnostic({
+      clientRequestId,
+      providerId: selectedProperty.providerId,
+      identityPropertyId: selectedProperty.identityPropertyId,
+      progress: ["initializing"]
+    });
+
     try {
       const client = clientRef.current || new BnbZkIdClient();
       clientRef.current = client;
@@ -339,13 +356,24 @@ export default function App() {
 
       const result = await client.prove(
         {
-          clientRequestId: "github-builder-passport-" + Date.now(),
+          clientRequestId,
           userAddress: walletAddress,
           identityPropertyId: liveSelection.identityPropertyId
         },
         {
           onProgress(event) {
             setStatus(event.status as ProgressStatus);
+            setProofDiagnostic((current) => {
+              if (!current) return current;
+              const last = current.progress[current.progress.length - 1];
+              return {
+                ...current,
+                progress: last === event.status
+                  ? current.progress
+                  : [...current.progress, event.status],
+                proofRequestId: event.proofRequestId || current.proofRequestId
+              };
+            });
           }
         }
       );
@@ -371,6 +399,16 @@ export default function App() {
       setProof(null);
       setProfile(null);
       setError(formatError(proofError));
+      setProofDiagnostic((current) => {
+        if (!current) return current;
+        const sdkError = proofError instanceof BnbZkIdProveError ? proofError : null;
+        return {
+          ...current,
+          errorCode: sdkError?.code,
+          sdkClientRequestId: sdkError?.clientRequestId,
+          proofRequestId: sdkError?.proofRequestId || current.proofRequestId
+        };
+      });
     } finally {
       setRunning(false);
     }
@@ -525,6 +563,17 @@ export default function App() {
         </article>
 
         {error && <div className="alert alert-error"><b>Could not continue</b><span>{error}</span></div>}
+        {error && proofDiagnostic && (
+          <div className="hint-box">
+            <b>Primus diagnostic details</b>
+            <small>Progress reached: {proofDiagnostic.progress.join(" → ")}</small>
+            <small>Provider ID: {proofDiagnostic.providerId}</small>
+            <small>Identity property ID: {proofDiagnostic.identityPropertyId}</small>
+            <small>Client request ID: {proofDiagnostic.sdkClientRequestId || proofDiagnostic.clientRequestId}</small>
+            {proofDiagnostic.errorCode && <small>SDK error code: {proofDiagnostic.errorCode}</small>}
+            {proofDiagnostic.proofRequestId && <small>Proof request ID: {proofDiagnostic.proofRequestId}</small>}
+          </div>
+        )}
 
         {proof && proof.status === "on_chain_attested" && (
           <section className="result-section">
