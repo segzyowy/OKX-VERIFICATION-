@@ -16,6 +16,10 @@ import {
 const DEFAULT_TEST_APP_ID =
   "0x36013DD48B0C1FBFE8906C0AF0CE521DDA69186AB6E6B5017DBF9691F9CF8E5C";
 const APP_ID = import.meta.env.VITE_PRIMUS_APP_ID?.trim() || DEFAULT_TEST_APP_ID;
+
+// Canonical GitHub account-contribution property bytes32 from the Primus BNB ZKID demo decoder.
+const GITHUB_IDENTITY_PROPERTY_HEX =
+  "0x0e5adf3535913ff915e7f062801a0f3a165711cb26709ec9574a9c45e091c7ff";
 const PRIMUS_EXTENSION_URL =
   "https://chromewebstore.google.com/detail/primus/oeiomhmbaapihbilkfkhmlajkeegnjhe";
 
@@ -64,8 +68,12 @@ function discoverGithubProperties(providers: Awaited<ReturnType<BnbZkIdClient["i
       // Gateway metadata is not always labelled at the provider level.
       // Match GitHub in either the provider or the specific property, but
       // never invent an identityPropertyId that Primus did not return.
-      const isGithubProperty = [provider.id, providerLabel, id, description]
-        .some((value) => value.toLowerCase().includes("github"));
+      const normalizedId = id.toLowerCase();
+      const isGithubProperty =
+        normalizedId === "github_account_age" ||
+        normalizedId === GITHUB_IDENTITY_PROPERTY_HEX ||
+        [provider.id, providerLabel, description]
+          .some((value) => value.toLowerCase().includes("github"));
       if (!isGithubProperty) continue;
 
       rows.push({
