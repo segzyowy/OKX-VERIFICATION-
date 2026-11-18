@@ -1,6 +1,7 @@
 import {
   createPublicClient,
   decodeAbiParameters,
+  getAddress,
   hexToString,
   http,
   isHex,
@@ -11,14 +12,13 @@ import {
 } from "viem";
 import { bscTestnet } from "viem/chains";
 
-const GITHUB_IDENTITY_PROPERTY_HEX =
-  "0x0e5adf3535913ff915e7f062801a0f3a165711cb26709ec9574a9c45e091c7ff" as Hex;
-
+const OKX_IDENTITY_PROPERTY_HEX =
+  "0x289d4fed0b3ecb26e711e6d1200b46f1d67f2da4847b03f99aa8584706933195" as Hex;
 const IDENTITY_PROPERTY_BY_GATEWAY_ID: Record<string, Hex> = {
-  github_account_age: GITHUB_IDENTITY_PROPERTY_HEX
+  okx_trade_kyc: OKX_IDENTITY_PROPERTY_HEX
 };
-
-const BNB_TESTNET_IDENTITY_REGISTRY = "0x9569299A8877Bc155232cF5Aa50AF42F9Fc32C7C" as Address;
+const BNB_TESTNET_IDENTITY_REGISTRY =
+  "0x9569299A8877Bc155232cF5Aa50AF42F9Fc32C7C" as Address;
 
 const REGISTRY_ABI = [
   {
@@ -45,9 +45,9 @@ export type PrimusAttestedResult = {
   proofRequestId?: string;
 };
 
-export type GithubAttestedProfile = {
-  accountEarliestYear: string;
-  contributionsLastYear: string;
+export type OkxKycAttestedData = {
+  /** KYC level decoded from the Primus registry payload. */
+  kycLevel: string;
   registryTimestamp: string;
   registry: string;
   chainId: number;
@@ -56,14 +56,14 @@ export type GithubAttestedProfile = {
 export function identityPropertyToBytes32(identityPropertyId: string): Hex {
   const key = identityPropertyId.trim();
   if (isHex(key, { strict: true }) && key.length === 66) {
-    if (key.toLowerCase() === GITHUB_IDENTITY_PROPERTY_HEX) {
-      return GITHUB_IDENTITY_PROPERTY_HEX;
+    if (key.toLowerCase() === OKX_IDENTITY_PROPERTY_HEX) {
+      return OKX_IDENTITY_PROPERTY_HEX;
     }
-    throw new Error("Primus returned a GitHub property without a reviewed decoder. Its proof reference can be shared, but no profile figures will be inferred.");
+    throw new Error("Primus returned an OKX property without a reviewed KYC decoder. No KYC level will be inferred.");
   }
-  const mapped = IDENTITY_PROPERTY_BY_GATEWAY_ID[key];
+  const mapped = IDENTITY_PROPERTY_BY_GATEWAY_ID[key.toLowerCase()];
   if (!mapped) {
-    throw new Error("Primus returned an identity property that this app does not yet decode.");
+    throw new Error("Primus returned an identity property that this app does not decode as OKX KYC.");
   }
   return mapped;
 }
@@ -79,79 +79,53 @@ export function providerIdToBytes32(providerId: string): Hex {
   return keccak256(toBytes(value));
 }
 
-function toIntegerString(value: unknown): string | null {
-  if (typeof value === "bigint") return value.toString();
-  if (typeof value === "number" && Number.isSafeInteger(value)) return String(value);
-  if (typeof value === "string" && /^\d+$/.test(value.trim())) return value.trim();
-  return null;
-}
-
-function decodeJsonBlob(text: string): { accountEarliestYear: string; contributionsLastYear: string } | null {
-  try {
-    const parsed: unknown = JSON.parse(text);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    let record = parsed as Record<string, unknown>;
-    if (record.data !== null && typeof record.data === "object" && !Array.isArray(record.data)) {
-      record = record.data as Record<string, unknown>;
-    }
-
-    const year = toIntegerString(
-      record.accountEarliestYear ?? record.account_earliest_year ?? record.earliestYear
-    );
-    const contributions = toIntegerString(
-      record.contributionsLastYear ??
-      record.contributions_last_year ??
-      record.contributionLastYear ??
-      record.lastYearContributions
-    );
-
-    return year !== null && contributions !== null
-      ? { accountEarliestYear: year, contributionsLastYear: contributions }
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function decodeGithubProfileBlob(dataBlob: Hex): { accountEarliestYear: string; contributionsLastYear: string } {
+function decodeOkxKycLevel(dataBlob: Hex): string {
   const text = hexToString(dataBlob).trim();
-
   if (text.startsWith("{")) {
-    const decoded = decodeJsonBlob(text);
-    if (decoded) return decoded;
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        let record = parsed as Record<string, unknown>;
+        if (record.data !== null && typeof record.data === "object" && !Array.isArray(record.data)) {
+          record = record.data as Record<string, unknown>;
+        }
+        if (typeof record.kycLevel === "string" && record.kycLevel.trim() !== "") {
+          return record.kycLevel.trim();
+        }
+      }
+    } catch {
+      // Fall through to the documented ABI tuple decoder.
+    }
   }
 
+  // Primus's official OKX schema is a tuple of (kycLevel, tradeHistoryLast6Months).
+  // The UI discloses only kycLevel, but the underlying attested property is bundled.
   const [profile] = decodeAbiParameters(
-    [
-      {
-        type: "tuple",
-        components: [
-          { name: "accountEarliestYear", type: "uint256" },
-          { name: "contributionsLastYear", type: "uint256" }
-        ]
-      }
-    ],
+    [{
+      type: "tuple",
+      components: [
+        { name: "kycLevel", type: "string" },
+        { name: "tradeHistoryLast6Months", type: "uint256" }
+      ]
+    }],
     dataBlob
   );
-
-  const year = toIntegerString(profile.accountEarliestYear);
-  const contributions = toIntegerString(profile.contributionsLastYear);
-  if (year === null || contributions === null) {
-    throw new Error("The GitHub attestation payload did not match the documented profile schema.");
+  if (typeof profile.kycLevel !== "string" || profile.kycLevel.trim() === "") {
+    throw new Error("The Primus OKX payload did not contain a readable KYC level.");
   }
-
-  return { accountEarliestYear: year, contributionsLastYear: contributions };
+  return profile.kycLevel.trim();
 }
 
 /**
- * Reads the registry record tied to a successful Primus BNB ZKID result.
- * This implementation targets the documented BNB testnet demo registry only.
+ * Reads the OKX property from the published BNB Smart Chain testnet demo registry.
+ * The decoded UI/share claim is KYC level only; Primus's source property also bundles
+ * six-month trade-history data. This is not a separate KYC-only cryptographic property.
  */
-export async function readGithubAttestedProfile(
+export async function readOkxAttestedKyc(
   proof: PrimusAttestedResult
-): Promise<GithubAttestedProfile> {
+): Promise<OkxKycAttestedData> {
   if (proof.status !== "on_chain_attested") {
-    throw new Error("A profile can only be read after Primus reports on-chain attestation.");
+    throw new Error("OKX KYC data can only be read after Primus reports on-chain attestation.");
   }
 
   const identityProperty = identityPropertyToBytes32(proof.identityPropertyId);
@@ -164,21 +138,19 @@ export async function readGithubAttestedProfile(
     chain: bscTestnet,
     transport: http(rpcUrl)
   });
-
   const [timestamp, dataBlob] = await client.readContract({
     address: BNB_TESTNET_IDENTITY_REGISTRY,
     abi: REGISTRY_ABI,
     functionName: "getLatestIdentityProperty",
-    args: [proof.walletAddress as Address, providerId, identityProperty]
+    args: [getAddress(proof.walletAddress) as Address, providerId, identityProperty]
   });
 
   if (!dataBlob || dataBlob === "0x") {
-    throw new Error("Primus attested successfully, but no GitHub profile payload was found in the demo registry.");
+    throw new Error("Primus attested successfully, but no OKX identity payload was found in the BNB testnet demo registry.");
   }
 
-  const profile = decodeGithubProfileBlob(dataBlob as Hex);
   return {
-    ...profile,
+    kycLevel: decodeOkxKycLevel(dataBlob as Hex),
     registryTimestamp: timestamp.toString(),
     registry: BNB_TESTNET_IDENTITY_REGISTRY,
     chainId: bscTestnet.id
@@ -188,14 +160,14 @@ export async function readGithubAttestedProfile(
 export type ShareablePassport = {
   version: 1;
   issuer: "Primus BNB ZKID";
-  title: "GitHub Builder Passport";
+  title: "OKX KYC Credential";
   status: "on_chain_attested";
   issuedAt: string;
   proofRequestId: string;
   providerId: string;
   identityPropertyId: string;
   walletAddress?: string;
-  profile?: GithubAttestedProfile;
+  kyc?: OkxKycAttestedData;
 };
 
 function encodeBase64Utf8(value: string): string {
@@ -229,7 +201,7 @@ export function readPassportFromUrl(): ShareablePassport | null {
       value.version !== 1 ||
       value.issuer !== "Primus BNB ZKID" ||
       value.status !== "on_chain_attested" ||
-      value.title !== "GitHub Builder Passport" ||
+      value.title !== "OKX KYC Credential" ||
       typeof value.proofRequestId !== "string" ||
       value.proofRequestId.trim().length === 0 ||
       typeof value.providerId !== "string" ||
