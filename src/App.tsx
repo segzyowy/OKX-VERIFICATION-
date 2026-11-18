@@ -20,6 +20,9 @@ const APP_ID = import.meta.env.VITE_PRIMUS_APP_ID?.trim() || DEFAULT_TEST_APP_ID
 // Canonical GitHub account-contribution property bytes32 from the Primus BNB ZKID demo decoder.
 const GITHUB_IDENTITY_PROPERTY_HEX =
   "0x0e5adf3535913ff915e7f062801a0f3a165711cb26709ec9574a9c45e091c7ff";
+// Canonical OKX KYC + trade-count property from the official Primus demo decoder.
+const OKX_IDENTITY_PROPERTY_HEX =
+  "0x289d4fed0b3ecb26e711e6d1200b46f1d67f2da4847b03f99aa8584706933195";
 const PRIMUS_EXTENSION_URL =
   "https://chromewebstore.google.com/detail/primus/oeiomhmbaapihbilkfkhmlajkeegnjhe";
 
@@ -27,7 +30,7 @@ type EthereumProvider = {
   request(args: { method: string; params?: unknown[] }): Promise<unknown>;
 };
 
-type GithubProperty = {
+type ProviderPropertyOption = {
   providerId: string;
   providerLabel: string;
   identityPropertyId: string;
@@ -56,8 +59,8 @@ function formatError(error: unknown): string {
   return String(error);
 }
 
-function discoverGithubProperties(providers: Awaited<ReturnType<BnbZkIdClient["init"]>>["providers"]): GithubProperty[] {
-  const rows: GithubProperty[] = [];
+function discoverGithubProperties(providers: Awaited<ReturnType<BnbZkIdClient["init"]>>["providers"]): ProviderPropertyOption[] {
+  const rows: ProviderPropertyOption[] = [];
   for (const provider of providers) {
     const providerLabel = provider.description?.trim() || provider.id;
     for (const property of provider.properties) {
@@ -87,11 +90,40 @@ function discoverGithubProperties(providers: Awaited<ReturnType<BnbZkIdClient["i
   return rows;
 }
 
+function discoverOkxProperties(providers: Awaited<ReturnType<BnbZkIdClient["init"]>>["providers"]): ProviderPropertyOption[] {
+  const rows: ProviderPropertyOption[] = [];
+  for (const provider of providers) {
+    const providerLabel = provider.description?.trim() || provider.id;
+    for (const property of provider.properties) {
+      const id = property.id.trim();
+      const description = property.description?.trim() || id;
+      if (!id) continue;
+
+      // Only accept an OKX identity property that Primus returned live and that
+      // matches its official OKX property identifier or explicit OKX metadata.
+      const isOkxProperty =
+        id.toLowerCase() === OKX_IDENTITY_PROPERTY_HEX ||
+        id.toLowerCase() === "okx_trade_kyc" ||
+        description.toLowerCase().includes("okx") ||
+        (providerLabel.toLowerCase().includes("okx") && /kyc|trade/i.test(description));
+      if (!isOkxProperty) continue;
+
+      rows.push({
+        providerId: provider.id,
+        providerLabel,
+        identityPropertyId: id,
+        description
+      });
+    }
+  }
+  return rows;
+}
+
 function statusLabel(status: ProgressStatus): string {
   const labels: Record<ProgressStatus, string> = {
     idle: "Ready to verify",
     initializing: "Connecting to Primus",
-    data_verifying: "Verifying GitHub data with zkTLS",
+    data_verifying: "Verifying source data with zkTLS",
     proof_generating: "Generating the ZK proof",
     on_chain_attested: "Primus proof attested",
     failed: "Verification failed"
@@ -237,7 +269,7 @@ function SharedPassportView({ passport }: { passport: ShareablePassport }) {
 export default function App() {
   const clientRef = useRef<BnbZkIdClient | null>(null);
   const [walletAddress, setWalletAddress] = useState("");
-  const [properties, setProperties] = useState<GithubProperty[]>([]);
+  const [properties, setProperties] = useState<ProviderPropertyOption[]>([]);
   const [selectedPropertyId, setSelectedPropertyId] = useState("");
   const [loadingProperties, setLoadingProperties] = useState(false);
   const [running, setRunning] = useState(false);
@@ -247,6 +279,22 @@ export default function App() {
   const [profileWarning, setProfileWarning] = useState("");
   const [error, setError] = useState("");
   const [proofDiagnostic, setProofDiagnostic] = useState<{
+    clientRequestId: string;
+    providerId: string;
+    identityPropertyId: string;
+    progress: string[];
+    errorCode?: string;
+    sdkClientRequestId?: string;
+    proofRequestId?: string;
+  } | null>(null);
+  const [okxProperties, setOkxProperties] = useState<ProviderPropertyOption[]>([]);
+  const [selectedOkxPropertyId, setSelectedOkxPropertyId] = useState("");
+  const [okxLoadingProperties, setOkxLoadingProperties] = useState(false);
+  const [okxRunning, setOkxRunning] = useState(false);
+  const [okxStatus, setOkxStatus] = useState<ProgressStatus>("idle");
+  const [okxResult, setOkxResult] = useState<ProveSuccessResult | null>(null);
+  const [okxError, setOkxError] = useState("");
+  const [okxDiagnostic, setOkxDiagnostic] = useState<{
     clientRequestId: string;
     providerId: string;
     identityPropertyId: string;
@@ -312,6 +360,119 @@ export default function App() {
       setError(formatError(loadError));
     } finally {
       setLoadingProperties(false);
+    }
+  }
+
+  async function loadOkxProperties() {
+    setOkxError("");
+    setOkxResult(null);
+    setOkxDiagnostic(null);
+    setOkxLoadingProperties(true);
+    try {
+      const client = new BnbZkIdClient();
+      const initialized = await client.init({ appId: APP_ID });
+      const rows = discoverOkxProperties(initialized.providers);
+      if (rows.length === 0) {
+        throw new Error("Primus did not return an enabled OKX identity property for this App ID. No fallback or guessed property will be used.");
+      }
+      setOkxProperties(rows);
+      setSelectedOkxPropertyId((current) =>
+        rows.some((row) => row.identityPropertyId === current)
+          ? current
+          : rows[0].identityPropertyId
+      );
+    } catch (loadError) {
+      setOkxProperties([]);
+      setSelectedOkxPropertyId("");
+      setOkxError(formatError(loadError));
+    } finally {
+      setOkxLoadingProperties(false);
+    }
+  }
+
+  async function runOkxTest() {
+    if (!walletAddress) {
+      setOkxError("Connect MetaMask before starting the OKX BNB ZKID test.");
+      return;
+    }
+    const selectedOption = okxProperties.find(
+      (item) => item.identityPropertyId === selectedOkxPropertyId
+    );
+    if (!selectedOption) {
+      setOkxError("Load and select an OKX identity property returned by Primus first.");
+      return;
+    }
+
+    setOkxError("");
+    setOkxResult(null);
+    setOkxRunning(true);
+    setOkxStatus("initializing");
+
+    const clientRequestId = "primus-okx-diagnostic-" + Date.now();
+    setOkxDiagnostic({
+      clientRequestId,
+      providerId: selectedOption.providerId,
+      identityPropertyId: selectedOption.identityPropertyId,
+      progress: ["initializing"]
+    });
+
+    try {
+      const client = new BnbZkIdClient();
+      const initialized = await client.init({ appId: APP_ID });
+      const liveSelection = discoverOkxProperties(initialized.providers).find(
+        (row) => row.identityPropertyId === selectedOption.identityPropertyId
+      );
+      if (!liveSelection) {
+        throw new Error("The selected OKX property is no longer enabled in Primus Gateway configuration. Reload OKX properties and try again.");
+      }
+
+      // The official demo does not add jumpToUrl for OKX. The extension handles
+      // the provider's source-page handoff using the live Primus template.
+      const result = await client.prove(
+        {
+          clientRequestId,
+          userAddress: walletAddress,
+          identityPropertyId: liveSelection.identityPropertyId
+        },
+        {
+          onProgress(event) {
+            setOkxStatus(event.status as ProgressStatus);
+            setOkxDiagnostic((current) => {
+              if (!current) return current;
+              const last = current.progress[current.progress.length - 1];
+              return {
+                ...current,
+                progress: last === event.status
+                  ? current.progress
+                  : [...current.progress, event.status],
+                proofRequestId: event.proofRequestId || current.proofRequestId
+              };
+            });
+          }
+        }
+      );
+
+      if (result.status !== "on_chain_attested") {
+        throw new Error("Primus did not return an on-chain attested OKX result.");
+      }
+
+      setOkxResult(result);
+      setOkxStatus("on_chain_attested");
+    } catch (testError) {
+      setOkxStatus("failed");
+      setOkxError(formatError(testError));
+      setOkxDiagnostic((current) => {
+        if (!current) return current;
+        const sdkError = testError instanceof BnbZkIdProveError ? testError : null;
+        return {
+          ...current,
+          errorCode: sdkError?.code,
+          sdkClientRequestId: sdkError?.clientRequestId,
+          proofRequestId: sdkError?.proofRequestId || current.proofRequestId
+        };
+      });
+    } finally {
+      setOkxRunning(false);
     }
   }
 
@@ -453,7 +614,7 @@ export default function App() {
           <span className="brand-mark">P</span>
           <span>PRIMUS <b>BUILDER ID</b></span>
         </a>
-        <span className="network-pill"><i /> ZK ID · GitHub</span>
+        <span className="network-pill"><i /> ZK ID · GitHub + OKX test</span>
       </header>
 
       <section className="hero">
@@ -461,7 +622,7 @@ export default function App() {
           <p className="eyebrow"><span className="eyebrow-line" /> BUILDER IDENTITY, PROVEN</p>
           <h1>Your work speaks.<br /><span>Proof makes it portable.</span></h1>
           <p className="hero-subtitle">
-            Create a verifiable GitHub Builder Passport. GitHub credentials only appear as verified after Primus completes its zkTLS and BNB ZKID proof flow.
+            Create a verifiable GitHub Builder Passport. GitHub credentials appear as verified only after Primus completes its zkTLS and BNB ZKID proof flow. An optional OKX test helps diagnose other Primus provider integrations.
           </p>
           <div className="hero-points">
             <span><b>✓</b> Primus proof only</span>
@@ -511,7 +672,7 @@ export default function App() {
           <article className="panel setup-panel">
             <div className="panel-top">
               <span className="panel-icon">02</span>
-              <div><h3>Load Primus properties</h3><p>Read the live GitHub identity properties enabled for this app.</p></div>
+              <div><h3>Load GitHub properties</h3><p>Read the live GitHub identity properties enabled for this app.</p></div>
             </div>
             <button className="button button-secondary full-button" onClick={loadGithubProperties} disabled={loadingProperties}>
               {loadingProperties ? <><span className="spinner" /> Loading properties</> : "Discover GitHub properties"}
@@ -615,6 +776,85 @@ export default function App() {
             </article>
           </section>
         )}
+        <article className="panel okx-test-panel">
+          <div className="panel-top">
+            <span className="panel-icon">OKX</span>
+            <div>
+              <h3>Alternative provider test: OKX</h3>
+              <p>Test whether Primus can collect an OKX identity property and complete an on-chain attestation.</p>
+            </div>
+          </div>
+          <div className="hint-box">
+            This is a separate diagnostic test, not a GitHub credential. A successful result confirms the OKX proof path only. It does not create or change your GitHub Builder Passport.
+          </div>
+          <button className="button button-secondary full-button" onClick={loadOkxProperties} disabled={okxLoadingProperties || okxRunning}>
+            {okxLoadingProperties ? <><span className="spinner" /> Loading live OKX property</> : "Load live OKX property"}
+          </button>
+          {okxProperties.length > 0 && (
+            <div className="property-selector">
+              <label htmlFor="okx-property">Primus OKX identity property</label>
+              <select
+                id="okx-property"
+                value={selectedOkxPropertyId}
+                onChange={(event) => setSelectedOkxPropertyId(event.target.value)}
+                disabled={okxRunning}
+              >
+                {okxProperties.map((property) => (
+                  <option key={property.identityPropertyId} value={property.identityPropertyId}>
+                    {property.description}
+                  </option>
+                ))}
+              </select>
+              <small>Source: live Primus Gateway configuration</small>
+            </div>
+          )}
+          <div className="proof-warning">
+            <span>i</span>
+            <p>Sign in to OKX in this browser profile before testing. Complete any sign-in only on the OKX page opened by Primus. Never enter your OKX password, API key, secret or verification code into this Passport.</p>
+          </div>
+          <button
+            className="button button-primary full-button"
+            onClick={runOkxTest}
+            disabled={okxRunning || !walletAddress || !selectedOkxPropertyId}
+          >
+            {okxRunning ? <><span className="spinner spinner-dark" /> Testing OKX with Primus</> : "Run OKX proof test"}
+          </button>
+          <div className="status-block">
+            <div className="status-top">
+              <span className="status-indicator" data-status={okxStatus} />
+              <b>{statusLabel(okxStatus)}</b>
+              {okxRunning && <span className="status-live">LIVE</span>}
+            </div>
+            <div className="progress-track"><i data-status={okxStatus} /></div>
+            <div className="status-steps">
+              <span className={["initializing","data_verifying","proof_generating","on_chain_attested"].includes(okxStatus) ? "active" : ""}>Initialize</span>
+              <span className={["data_verifying","proof_generating","on_chain_attested"].includes(okxStatus) ? "active" : ""}>zkTLS verify</span>
+              <span className={["proof_generating","on_chain_attested"].includes(okxStatus) ? "active" : ""}>ZK proof</span>
+              <span className={okxStatus === "on_chain_attested" ? "active" : ""}>Attested</span>
+            </div>
+          </div>
+          {okxError && <div className="alert alert-error"><b>OKX test failed</b><span>{okxError}</span></div>}
+          {okxError && okxDiagnostic && (
+            <div className="hint-box">
+              <b>OKX diagnostic details</b>
+              <small>Progress reached: {okxDiagnostic.progress.join(" → ")}</small>
+              <small>Provider ID: {okxDiagnostic.providerId}</small>
+              <small>Identity property ID: {okxDiagnostic.identityPropertyId}</small>
+              <small>Client request ID: {okxDiagnostic.sdkClientRequestId || okxDiagnostic.clientRequestId}</small>
+              {okxDiagnostic.errorCode && <small>SDK error code: {okxDiagnostic.errorCode}</small>}
+              {okxDiagnostic.proofRequestId && <small>Proof request ID: {okxDiagnostic.proofRequestId}</small>}
+            </div>
+          )}
+          {okxResult && (
+            <div className="hint-box">
+              <b>OKX test succeeded — Primus on-chain attestation received.</b>
+              <small>Provider ID: {okxResult.providerId}</small>
+              <small>Identity property ID: {okxResult.identityPropertyId}</small>
+              <small>Proof request ID: {okxResult.proofRequestId || "Not returned"}</small>
+              <small>This diagnostic build does not decode OKX registry claims or issue an OKX passport.</small>
+            </div>
+          )}
+        </article>
       </section>
 
       <footer className="footer">
