@@ -55,21 +55,24 @@ function formatError(error: unknown): string {
 function discoverGithubProperties(providers: Awaited<ReturnType<BnbZkIdClient["init"]>>["providers"]): GithubProperty[] {
   const rows: GithubProperty[] = [];
   for (const provider of providers) {
-    const providerLabel =
-      provider.description?.trim() || provider.id;
-    const isGithubProvider =
-      provider.id.toLowerCase().includes("github") ||
-      providerLabel.toLowerCase().includes("github");
-    if (!isGithubProvider) continue;
-
+    const providerLabel = provider.description?.trim() || provider.id;
     for (const property of provider.properties) {
       const id = property.id.trim();
+      const description = property.description?.trim() || id;
       if (!id) continue;
+
+      // Gateway metadata is not always labelled at the provider level.
+      // Match GitHub in either the provider or the specific property, but
+      // never invent an identityPropertyId that Primus did not return.
+      const isGithubProperty = [provider.id, providerLabel, id, description]
+        .some((value) => value.toLowerCase().includes("github"));
+      if (!isGithubProperty) continue;
+
       rows.push({
         providerId: provider.id,
         providerLabel,
         identityPropertyId: id,
-        description: property.description?.trim() || id
+        description
       });
     }
   }
