@@ -42,6 +42,15 @@ type ProgressStatus =
 
 type SharedVerification = "checking" | "verified" | "failed";
 
+type GatewayResponseDiagnostic = {
+  httpStatus: number;
+  responseStatus?: string;
+  proofRequestId?: string;
+  errorCategory?: string;
+  errorCode?: string;
+  errorMessage?: string;
+};
+
 type ProofDiagnostic = {
   clientRequestId: string;
   providerId: string;
@@ -50,7 +59,67 @@ type ProofDiagnostic = {
   errorCode?: string;
   sdkClientRequestId?: string;
   proofRequestId?: string;
+  gatewayResponse?: GatewayResponseDiagnostic;
 };
+
+function captureGatewayProofResponse(
+  onCaptured: (details: GatewayResponseDiagnostic) => void
+): () => void {
+  const originalFetch = window.fetch;
+  const wrappedFetch: typeof window.fetch = async (...args) => {
+    const [input, init] = args;
+    const response = await originalFetch(...args);
+
+    try {
+      const requestUrl = input instanceof Request ? input.url : input.toString();
+      const requestMethod = (init?.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
+      const parsedUrl = new URL(requestUrl, window.location.href);
+
+      if (
+        requestMethod === "POST" &&
+        parsedUrl.origin === "https://zk-id.brevis.network" &&
+        parsedUrl.pathname === "/v1/proof-requests"
+      ) {
+        const body: unknown = await response.clone().json();
+        if (body !== null && typeof body === "object" && !Array.isArray(body)) {
+          const record = body as Record<string, unknown>;
+          const error = record.error !== null && typeof record.error === "object" && !Array.isArray(record.error)
+            ? record.error as Record<string, unknown>
+            : undefined;
+          const message = typeof error?.message === "string"
+            ? error.message
+            : typeof error?.detail === "string"
+              ? error.detail
+              : undefined;
+
+          onCaptured({
+            httpStatus: response.status,
+            ...(typeof record.status === "string" ? { responseStatus: record.status } : {}),
+            ...(typeof record.proofRequestId === "string" && record.proofRequestId.trim()
+              ? { proofRequestId: record.proofRequestId.trim() }
+              : {}),
+            ...(typeof error?.category === "string" ? { errorCategory: error.category } : {}),
+            ...(typeof error?.code === "string" ? { errorCode: error.code } : {}),
+            ...(message ? { errorMessage: message.slice(0, 500) } : {})
+          });
+        } else {
+          onCaptured({ httpStatus: response.status });
+        }
+      }
+    } catch {
+      // Diagnostic capture must never interrupt the SDK's original fetch response.
+    }
+
+    return response;
+  };
+
+  window.fetch = wrappedFetch;
+  return () => {
+    if (window.fetch === wrappedFetch) {
+      window.fetch = originalFetch;
+    }
+  };
+}
 
 function getEthereum(): EthereumProvider | undefined {
   return (window as Window & { ethereum?: EthereumProvider }).ethereum;
@@ -335,30 +404,40 @@ export default function App() {
         throw new Error("The selected OKX property is no longer enabled in Primus Gateway configuration. Reload properties and try again.");
       }
 
-      // The official Primus demo's normal OKX flow does not pass jumpToUrl.
-      const result = await client.prove(
-        {
-          clientRequestId,
-          userAddress: walletAddress,
-          identityPropertyId: liveSelection.identityPropertyId
-        },
-        {
-          onProgress(event) {
-            setStatus(event.status as ProgressStatus);
-            setDiagnostic((current) => {
-              if (!current) return current;
-              const last = current.progress[current.progress.length - 1];
-              return {
-                ...current,
-                progress: last === event.status
-                  ? current.progress
-                  : [...current.progress, event.status],
-                proofRequestId: event.proofRequestId || current.proofRequestId
-              };
-            });
+      // Capture only the Gateway response metadata. Never read or store the zkTLS proof payload.
+      const restoreGatewayCapture = captureGatewayProofResponse((gatewayResponse) => {
+        setDiagnostic((current) => current ? { ...current, gatewayResponse } : current);
+      });
+
+      let result: ProveSuccessResult;
+      try {
+        // The official Primus demo's normal OKX flow does not pass jumpToUrl.
+        result = await client.prove(
+          {
+            clientRequestId,
+            userAddress: walletAddress,
+            identityPropertyId: liveSelection.identityPropertyId
+          },
+          {
+            onProgress(event) {
+              setStatus(event.status as ProgressStatus);
+              setDiagnostic((current) => {
+                if (!current) return current;
+                const last = current.progress[current.progress.length - 1];
+                return {
+                  ...current,
+                  progress: last === event.status
+                    ? current.progress
+                    : [...current.progress, event.status],
+                  proofRequestId: event.proofRequestId || current.proofRequestId
+                };
+              });
+            }
           }
-        }
-      );
+        );
+      } finally {
+        restoreGatewayCapture();
+      }
 
       if (result.status !== "on_chain_attested") {
         throw new Error("Primus did not return an on-chain attested OKX result.");
@@ -556,6 +635,16 @@ export default function App() {
             <small>Client request ID: {diagnostic.sdkClientRequestId || diagnostic.clientRequestId}</small>
             {diagnostic.errorCode && <small>SDK error code: {diagnostic.errorCode}</small>}
             {diagnostic.proofRequestId && <small>Proof request ID: {diagnostic.proofRequestId}</small>}
+            {diagnostic.gatewayResponse && (
+              <>
+                <small>Gateway HTTP status: {diagnostic.gatewayResponse.httpStatus}</small>
+                {diagnostic.gatewayResponse.responseStatus && <small>Gateway status: {diagnostic.gatewayResponse.responseStatus}</small>}
+                {diagnostic.gatewayResponse.errorCategory && <small>Gateway error category: {diagnostic.gatewayResponse.errorCategory}</small>}
+                {diagnostic.gatewayResponse.errorCode && <small>Gateway error code: {diagnostic.gatewayResponse.errorCode}</small>}
+                {diagnostic.gatewayResponse.errorMessage && <small>Gateway message: {diagnostic.gatewayResponse.errorMessage}</small>}
+                {diagnostic.gatewayResponse.proofRequestId && <small>Gateway proof request ID: {diagnostic.gatewayResponse.proofRequestId}</small>}
+              </>
+            )}
           </div>
         )}
 
