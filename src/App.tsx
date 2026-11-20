@@ -1,697 +1,335 @@
-import { useEffect, useMemo, useState } from "react";
-import {
-  BnbZkIdClient,
-  BnbZkIdProveError,
-  type ProveSuccessResult
-} from "@primuslabs/bnb-zkid-sdk";
-import {
-  makePassportUrl,
-  readOkxAttestedKyc,
-  readPassportFromUrl,
-  type OkxKycAttestedData,
-  type PrimusAttestedResult,
-  type ShareablePassport
-} from "./verification";
+import { useEffect, useState } from "react";
+import { PrimusZKTLS } from "@primuslabs/zktls-js-sdk";
 
-const DEFAULT_TEST_APP_ID =
-  "0x36013DD48B0C1FBFE8906C0AF0CE521DDA69186AB6E6B5017DBF9691F9CF8E5C";
-const APP_ID = import.meta.env.VITE_PRIMUS_APP_ID?.trim() || DEFAULT_TEST_APP_ID;
-const OKX_IDENTITY_PROPERTY_HEX =
-  "0x289d4fed0b3ecb26e711e6d1200b46f1d67f2da4847b03f99aa8584706933195";
-const PRIMUS_EXTENSION_URL =
-  "https://chromewebstore.google.com/detail/primus/oeiomhmbaapihbilkfkhmlajkeegnjhe";
+const APP_ID = import.meta.env.VITE_PRIMUS_APP_ID?.trim() ?? "";
+const TEMPLATE_ID = import.meta.env.VITE_PRIMUS_TEMPLATE_ID?.trim() ?? "";
+const PRIMUS_EXTENSION_URL = "https://chromewebstore.google.com/detail/primus/oeiomhmbaapihbilkfkhmlajkeegnjhe";
 
 type EthereumProvider = {
   request(args: { method: string; params?: unknown[] }): Promise<unknown>;
+  on?(event: "accountsChanged", callback: (accounts: string[]) => void): void;
+  removeListener?(event: "accountsChanged", callback: (accounts: string[]) => void): void;
 };
 
-type OkxProperty = {
-  providerId: string;
-  providerLabel: string;
-  identityPropertyId: string;
-  description: string;
-};
-
-type ProgressStatus =
-  | "idle"
-  | "initializing"
-  | "data_verifying"
-  | "proof_generating"
-  | "on_chain_attested"
-  | "failed";
-
-type SharedVerification = "checking" | "verified" | "failed";
-
-type GatewayResponseDiagnostic = {
-  httpStatus: number;
-  responseStatus?: string;
-  proofRequestId?: string;
-  errorCategory?: string;
-  errorCode?: string;
-  errorMessage?: string;
-};
-
-type ProofDiagnostic = {
-  clientRequestId: string;
-  providerId: string;
-  identityPropertyId: string;
-  progress: string[];
-  errorCode?: string;
-  sdkClientRequestId?: string;
-  proofRequestId?: string;
-  gatewayResponse?: GatewayResponseDiagnostic;
-};
-
-function captureGatewayProofResponse(
-  onCaptured: (details: GatewayResponseDiagnostic) => void
-): () => void {
-  const originalFetch = window.fetch;
-  const wrappedFetch: typeof window.fetch = async (...args) => {
-    const [input, init] = args;
-    const response = await originalFetch(...args);
-
-    try {
-      const requestUrl = input instanceof Request ? input.url : input.toString();
-      const requestMethod = (init?.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
-      const parsedUrl = new URL(requestUrl, window.location.href);
-
-      if (
-        requestMethod === "POST" &&
-        parsedUrl.origin === "https://zk-id.brevis.network" &&
-        parsedUrl.pathname === "/v1/proof-requests"
-      ) {
-        const body: unknown = await response.clone().json();
-        if (body !== null && typeof body === "object" && !Array.isArray(body)) {
-          const record = body as Record<string, unknown>;
-          const error = record.error !== null && typeof record.error === "object" && !Array.isArray(record.error)
-            ? record.error as Record<string, unknown>
-            : undefined;
-          const message = typeof error?.message === "string"
-            ? error.message
-            : typeof error?.detail === "string"
-              ? error.detail
-              : undefined;
-
-          onCaptured({
-            httpStatus: response.status,
-            ...(typeof record.status === "string" ? { responseStatus: record.status } : {}),
-            ...(typeof record.proofRequestId === "string" && record.proofRequestId.trim()
-              ? { proofRequestId: record.proofRequestId.trim() }
-              : {}),
-            ...(typeof error?.category === "string" ? { errorCategory: error.category } : {}),
-            ...(typeof error?.code === "string" ? { errorCode: error.code } : {}),
-            ...(message ? { errorMessage: message.slice(0, 500) } : {})
-          });
-        } else {
-          onCaptured({ httpStatus: response.status });
-        }
-      }
-    } catch {
-      // Diagnostic capture must never interrupt the SDK's original fetch response.
-    }
-
-    return response;
-  };
-
-  window.fetch = wrappedFetch;
-  return () => {
-    if (window.fetch === wrappedFetch) {
-      window.fetch = originalFetch;
-    }
-  };
-}
-
-function getEthereum(): EthereumProvider | undefined {
-  return (window as Window & { ethereum?: EthereumProvider }).ethereum;
-}
-
-function formatError(error: unknown): string {
-  if (error instanceof BnbZkIdProveError) {
-    return error.message + (error.code ? " (code " + error.code + ")" : "");
+declare global {
+  interface Window {
+    ethereum?: EthereumProvider;
   }
-  if (error instanceof Error) return error.message;
-  return String(error);
 }
 
-function discoverOkxProperties(
-  providers: Awaited<ReturnType<BnbZkIdClient["init"]>>["providers"]
-): OkxProperty[] {
-  const rows: OkxProperty[] = [];
-  for (const provider of providers) {
-    const providerLabel = provider.description?.trim() || provider.id;
-    for (const property of provider.properties) {
-      const id = property.id.trim();
-      const description = property.description?.trim() || id;
-      if (!id) continue;
+type Result = { recipient: string; timestamp: number; data: unknown };
+type Readiness = "checking" | "ready" | "missing-config" | "missing-extension" | "error";
 
-      const isOkxProperty =
-        id.toLowerCase() === OKX_IDENTITY_PROPERTY_HEX ||
-        id.toLowerCase() === "okx_trade_kyc" ||
-        description.toLowerCase().includes("okx") ||
-        (providerLabel.toLowerCase().includes("okx") && /kyc|trade/i.test(description));
-      if (!isOkxProperty) continue;
+let primusPromise: Promise<PrimusZKTLS> | null = null;
 
-      rows.push({
-        providerId: provider.id,
-        providerLabel,
-        identityPropertyId: id,
-        description
-      });
-    }
+function getPrimusClient(): Promise<PrimusZKTLS> {
+  if (!APP_ID) return Promise.reject(new Error("Add VITE_PRIMUS_APP_ID to your deployment environment variables."));
+  if (!primusPromise) {
+    const client = new PrimusZKTLS();
+    primusPromise = client.init(APP_ID).then(() => client).catch((error) => {
+      primusPromise = null;
+      throw error;
+    });
   }
-  return rows;
+  return primusPromise;
 }
 
-function statusLabel(status: ProgressStatus): string {
-  const labels: Record<ProgressStatus, string> = {
-    idle: "Ready to verify",
-    initializing: "Connecting to Primus",
-    data_verifying: "Verifying OKX data with zkTLS",
-    proof_generating: "Generating the ZK proof",
-    on_chain_attested: "Primus proof attested",
-    failed: "Verification failed"
-  };
-  return labels[status];
+function readableError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("00006") || message.toLowerCase().includes("extension")) {
+    return "The Primus browser extension is not available. Install or enable it, then reload this page.";
+  }
+  return message || "An unexpected error occurred.";
 }
 
-function shortAddress(value?: string): string {
-  if (!value) return "Not disclosed";
-  return value.slice(0, 6) + "…" + value.slice(-4);
+function isEvmAddress(value: string): boolean {
+  return /^0x[a-fA-F0-9]{40}$/.test(value.trim());
 }
 
-function SharedKycView({ passport }: { passport: ShareablePassport }) {
-  const [verificationState, setVerificationState] = useState<SharedVerification>("checking");
-  const [verificationMessage, setVerificationMessage] = useState(
-    "Checking the proof reference with Primus. Keep the Primus extension enabled."
-  );
-  const [currentKyc, setCurrentKyc] = useState<OkxKycAttestedData | null>(null);
+function shortAddress(value: string): string {
+  return value ? value.slice(0, 6) + "…" + value.slice(-4) : "";
+}
 
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const client = new BnbZkIdClient();
-        await client.init({ appId: APP_ID });
-        const result = await client.queryProofResult({ proofRequestId: passport.proofRequestId });
-        if (result.status !== "on_chain_attested") {
-          throw new Error("Primus does not currently report this proof as on-chain attested.");
-        }
-        if (
-          result.providerId !== passport.providerId ||
-          result.identityPropertyId !== passport.identityPropertyId
-        ) {
-          throw new Error("The shared OKX provider or identity property does not match the Primus proof.");
-        }
-        if (
-          passport.walletAddress &&
-          result.walletAddress.toLowerCase() !== passport.walletAddress.toLowerCase()
-        ) {
-          throw new Error("The disclosed wallet address does not match the Primus proof.");
-        }
-
-        if (passport.kyc) {
-          const liveKyc = await readOkxAttestedKyc(result as PrimusAttestedResult);
-          if (
-            liveKyc.kycLevel !== passport.kyc.kycLevel ||
-            liveKyc.registryTimestamp !== passport.kyc.registryTimestamp ||
-            liveKyc.registry.toLowerCase() !== passport.kyc.registry.toLowerCase() ||
-            liveKyc.chainId !== passport.kyc.chainId
-          ) {
-            throw new Error("The shared KYC level does not match the current Primus registry payload.");
-          }
-          if (!cancelled) setCurrentKyc(liveKyc);
-        }
-
-        if (!cancelled) {
-          setVerificationState("verified");
-          setVerificationMessage("Primus confirmed the on-chain proof reference and shared OKX KYC field.");
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setVerificationState("failed");
-          setVerificationMessage(formatError(error));
-        }
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [passport]);
-
-  const sealText =
-    verificationState === "verified"
-      ? "VERIFIED BY PRIMUS"
-      : verificationState === "checking"
-        ? "CHECKING PRIMUS PROOF"
-        : "NOT VERIFIED";
-
-  return (
-    <main className="page-shell share-shell">
-      <header className="topbar">
-        <a className="brand" href={window.location.pathname}>
-          <span className="brand-mark">P</span>
-          <span>PRIMUS <b>OKX KYC</b></span>
-        </a>
-        <span className="network-pill"><i /> Primus proof lookup</span>
-      </header>
-      <section className="passport-card public-passport">
-        <div className="passport-orbit">✳</div>
-        <p className="eyebrow">VERIFIABLE OKX ACCOUNT CREDENTIAL</p>
-        <h1>OKX KYC<br /><span>Credential</span></h1>
-        <div className={"verified-seal " + verificationState}>
-          <span>{verificationState === "verified" ? "✓" : verificationState === "checking" ? "…" : "!"}</span>
-          <b>{sealText}</b>
-        </div>
-        <div className={"passport-check-alert " + verificationState}>{verificationMessage}</div>
-        <div className="credential-list">
-          <div className="credential-row">
-            <div><span className="credential-icon">OKX</span></div>
-            <div className="credential-copy">
-              <b>OKX KYC identity property</b>
-              <small>{passport.identityPropertyId}</small>
-            </div>
-            {verificationState === "verified" ? <span className="verified-tag">VERIFIED</span> : <span className="pending-tag">PENDING</span>}
-          </div>
-          {currentKyc ? (
-            <div className="credential-row">
-              <div><span className="credential-icon">KYC</span></div>
-              <div className="credential-copy">
-                <b>KYC level</b>
-                <small>Decoded from the Primus BNB testnet registry</small>
-              </div>
-              <strong className="credential-value">{currentKyc.kycLevel}</strong>
-            </div>
-          ) : (
-            <p className="muted-note">This passport shares the Primus proof reference without a decoded KYC level.</p>
-          )}
-        </div>
-        <div className="passport-meta">
-          <div><small>PROOF REQUEST</small><b>{passport.proofRequestId}</b></div>
-          <div><small>WALLET</small><b>{shortAddress(passport.walletAddress)}</b></div>
-          <div><small>ISSUER</small><b>{passport.issuer}</b></div>
-        </div>
-        <p className="fine-print">
-          The Primus OKX identity property currently bundles KYC level with six-month trade-history data. This page displays and shares only the KYC level; it does not claim to use a separate KYC-only cryptographic property.
-        </p>
-      </section>
-      <p className="share-footer">Powered by Primus zkTLS · BNB ZKID</p>
-    </main>
-  );
+function timestampLabel(value: number): string {
+  const millis = value > 1_000_000_000_000 ? value : value * 1000;
+  const date = new Date(millis);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
 }
 
 export default function App() {
   const [walletAddress, setWalletAddress] = useState("");
-  const [properties, setProperties] = useState<OkxProperty[]>([]);
-  const [selectedPropertyId, setSelectedPropertyId] = useState("");
-  const [loadingProperties, setLoadingProperties] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [status, setStatus] = useState<ProgressStatus>("idle");
-  const [proof, setProof] = useState<ProveSuccessResult | null>(null);
-  const [kyc, setKyc] = useState<OkxKycAttestedData | null>(null);
-  const [kycWarning, setKycWarning] = useState("");
+  const [manualAddress, setManualAddress] = useState("");
+  const [readiness, setReadiness] = useState<Readiness>("checking");
+  const [readinessMessage, setReadinessMessage] = useState("Checking Primus configuration and extension…");
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [diagnostic, setDiagnostic] = useState<ProofDiagnostic | null>(null);
-  const [includeKyc, setIncludeKyc] = useState(true);
-  const [includeWallet, setIncludeWallet] = useState(false);
-  const [shareMessage, setShareMessage] = useState("");
-  const [sharedPassport, setSharedPassport] = useState<ShareablePassport | null>(null);
-
-  const selectedProperty = useMemo(
-    () => properties.find((item) => item.identityPropertyId === selectedPropertyId),
-    [properties, selectedPropertyId]
-  );
+  const [result, setResult] = useState<Result | null>(null);
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
-    const fromUrl = readPassportFromUrl();
-    if (fromUrl) setSharedPassport(fromUrl);
+    let active = true;
+    if (!APP_ID || !TEMPLATE_ID) {
+      setReadiness("missing-config");
+      setReadinessMessage("Add the public App ID and your real Primus Template ID in Vercel.");
+    } else {
+      void getPrimusClient().then(() => {
+        if (active) {
+          setReadiness("ready");
+          setReadinessMessage("Primus is ready. The browser extension is connected.");
+        }
+      }).catch((cause) => {
+        if (active) {
+          const message = readableError(cause);
+          setReadiness(message.includes("extension") ? "missing-extension" : "error");
+          setReadinessMessage(message);
+        }
+      });
+    }
+
+    const provider = window.ethereum;
+    const onAccountsChanged = (accounts: string[]) => setWalletAddress(accounts?.[0] ?? "");
+    provider?.on?.("accountsChanged", onAccountsChanged);
+    return () => {
+      active = false;
+      provider?.removeListener?.("accountsChanged", onAccountsChanged);
+    };
   }, []);
+
+  async function retryInitialization() {
+    setReadiness("checking");
+    setReadinessMessage("Connecting to the Primus extension…");
+    try {
+      await getPrimusClient();
+      setReadiness("ready");
+      setReadinessMessage("Primus is ready. The browser extension is connected.");
+    } catch (cause) {
+      const message = readableError(cause);
+      setReadiness(message.includes("extension") ? "missing-extension" : "error");
+      setReadinessMessage(message);
+    }
+  }
 
   async function connectWallet() {
     setError("");
-    const ethereum = getEthereum();
-    if (!ethereum) {
-      setError("MetaMask was not detected. Install MetaMask or use a browser with an injected EVM wallet.");
+    const provider = window.ethereum;
+    if (!provider) {
+      setError("MetaMask was not detected. You can paste an EVM wallet address below instead.");
       return;
     }
     try {
-      const accounts = await ethereum.request({ method: "eth_requestAccounts" });
-      if (!Array.isArray(accounts) || typeof accounts[0] !== "string" || !accounts[0]) {
-        throw new Error("Your wallet did not return an account.");
-      }
-      setWalletAddress(accounts[0]);
-    } catch (walletError) {
-      setError(formatError(walletError));
+      const accounts = await provider.request({ method: "eth_requestAccounts" });
+      const first = Array.isArray(accounts) ? accounts[0] : "";
+      if (typeof first !== "string" || !isEvmAddress(first)) throw new Error("MetaMask did not return a valid EVM address.");
+      setWalletAddress(first);
+      setManualAddress(first);
+    } catch (cause) {
+      setError(readableError(cause));
     }
   }
 
-  async function loadOkxProperties() {
+  function useManualAddress() {
+    const value = manualAddress.trim();
+    if (!isEvmAddress(value)) {
+      setError("Enter a valid EVM address beginning with 0x and containing 40 hexadecimal characters.");
+      return;
+    }
     setError("");
-    setShareMessage("");
-    setLoadingProperties(true);
-    try {
-      const client = new BnbZkIdClient();
-      const initialized = await client.init({ appId: APP_ID });
-      const rows = discoverOkxProperties(initialized.providers);
-      if (rows.length === 0) {
-        throw new Error("Primus did not return an enabled OKX KYC identity property for this App ID. No fallback or guessed property will be used.");
-      }
-      setProperties(rows);
-      setSelectedPropertyId((current) =>
-        rows.some((row) => row.identityPropertyId === current)
-          ? current
-          : rows[0].identityPropertyId
-      );
-    } catch (loadError) {
-      setProperties([]);
-      setSelectedPropertyId("");
-      setError(formatError(loadError));
-    } finally {
-      setLoadingProperties(false);
-    }
+    setWalletAddress(value);
   }
 
-  async function runOkxProof() {
-    if (!walletAddress) {
-      setError("Connect your EVM wallet before starting the Primus OKX proof.");
-      return;
-    }
-    if (!selectedProperty) {
-      setError("Load the live Primus OKX property before starting verification.");
-      return;
-    }
-
+  async function generateAttestation() {
     setError("");
-    setShareMessage("");
-    setKycWarning("");
-    setProof(null);
-    setKyc(null);
-    setRunning(true);
-    setStatus("initializing");
+    setResult(null);
+    setCopied(false);
 
-    const clientRequestId = "primus-okx-kyc-" + Date.now();
-    setDiagnostic({
-      clientRequestId,
-      providerId: selectedProperty.providerId,
-      identityPropertyId: selectedProperty.identityPropertyId,
-      progress: ["initializing"]
-    });
-
-    try {
-      const client = new BnbZkIdClient();
-      const initialized = await client.init({ appId: APP_ID });
-      const liveSelection = discoverOkxProperties(initialized.providers).find(
-        (row) => row.identityPropertyId === selectedProperty.identityPropertyId
-      );
-      if (!liveSelection) {
-        throw new Error("The selected OKX property is no longer enabled in Primus Gateway configuration. Reload properties and try again.");
-      }
-
-      // Capture only the Gateway response metadata. Never read or store the zkTLS proof payload.
-      const restoreGatewayCapture = captureGatewayProofResponse((gatewayResponse) => {
-        setDiagnostic((current) => current ? { ...current, gatewayResponse } : current);
-      });
-
-      let result: ProveSuccessResult;
-      try {
-        // The official Primus demo's normal OKX flow does not pass jumpToUrl.
-        result = await client.prove(
-          {
-            clientRequestId,
-            userAddress: walletAddress,
-            identityPropertyId: liveSelection.identityPropertyId
-          },
-          {
-            onProgress(event) {
-              setStatus(event.status as ProgressStatus);
-              setDiagnostic((current) => {
-                if (!current) return current;
-                const last = current.progress[current.progress.length - 1];
-                return {
-                  ...current,
-                  progress: last === event.status
-                    ? current.progress
-                    : [...current.progress, event.status],
-                  proofRequestId: event.proofRequestId || current.proofRequestId
-                };
-              });
-            }
-          }
-        );
-      } finally {
-        restoreGatewayCapture();
-      }
-
-      if (result.status !== "on_chain_attested") {
-        throw new Error("Primus did not return an on-chain attested OKX result.");
-      }
-      setProof(result);
-      setStatus("on_chain_attested");
-
-      try {
-        const decodedKyc = await readOkxAttestedKyc(result as PrimusAttestedResult);
-        setKyc(decodedKyc);
-      } catch (readError) {
-        setKycWarning(
-          "Primus attested the OKX property, but the app could not read or decode its KYC level from the testnet registry: " +
-          formatError(readError)
-        );
-      }
-    } catch (proofError) {
-      setStatus("failed");
-      setProof(null);
-      setKyc(null);
-      setError(formatError(proofError));
-      setDiagnostic((current) => {
-        if (!current) return current;
-        const sdkError = proofError instanceof BnbZkIdProveError ? proofError : null;
-        return {
-          ...current,
-          errorCode: sdkError?.code,
-          sdkClientRequestId: sdkError?.clientRequestId,
-          proofRequestId: sdkError?.proofRequestId || current.proofRequestId
-        };
-      });
-    } finally {
-      setRunning(false);
+    if (!walletAddress || !isEvmAddress(walletAddress)) {
+      setError("Connect MetaMask or enter a valid EVM wallet address first.");
+      return;
     }
-  }
-
-  async function shareKycCredential() {
-    if (!proof || proof.status !== "on_chain_attested") return;
-    if (!proof.proofRequestId) {
-      setError("Primus did not return a proof request ID. This result cannot be independently checked, so a shareable credential was not created.");
+    if (!APP_ID || !TEMPLATE_ID) {
+      setError("The Primus App ID or Template ID is missing. Configure both in Vercel before generating an attestation.");
       return;
     }
 
-    const passport: ShareablePassport = {
-      version: 1,
-      issuer: "Primus BNB ZKID",
-      title: "OKX KYC Credential",
-      status: "on_chain_attested",
-      issuedAt: new Date().toISOString(),
-      providerId: proof.providerId,
-      identityPropertyId: proof.identityPropertyId,
-      proofRequestId: proof.proofRequestId,
-      ...(includeWallet ? { walletAddress: proof.walletAddress } : {}),
-      ...(includeKyc && kyc ? { kyc } : {})
-    };
-
+    setBusy(true);
     try {
-      await navigator.clipboard.writeText(makePassportUrl(passport));
-      setShareMessage("OKX credential link copied. Recipients must check the proof with Primus before relying on its claims.");
+      const client = await getPrimusClient();
+      const request = client.generateRequestParams(TEMPLATE_ID, walletAddress);
+      request.setAttMode({ algorithmType: "proxytls" });
+      const requestStr = request.toJsonString();
+
+      const response = await fetch("/api/primus/sign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ signParams: requestStr })
+      });
+      const payload: unknown = await response.json().catch(() => null);
+      const responseData = payload && typeof payload === "object"
+        ? payload as { signResult?: unknown; error?: unknown }
+        : {};
+
+      if (!response.ok) {
+        throw new Error(typeof responseData.error === "string" ? responseData.error : "The signing service rejected the request.");
+      }
+      if (typeof responseData.signResult !== "string" || !responseData.signResult) {
+        throw new Error("The signing service did not return a signed request.");
+      }
+
+      const attestation = await client.startAttestation(responseData.signResult);
+      if (!client.verifyAttestation(attestation)) {
+        throw new Error("Primus returned an attestation whose signature could not be verified.");
+      }
+      if (typeof attestation.recipient !== "string" ||
+          attestation.recipient.toLowerCase() !== walletAddress.toLowerCase()) {
+        throw new Error("The attestation recipient does not match the connected wallet address.");
+      }
+
+      let data: unknown = attestation.data;
+      if (typeof attestation.data === "string") {
+        try {
+          data = JSON.parse(attestation.data) as unknown;
+        } catch {
+          data = attestation.data;
+        }
+      }
+      setResult({ recipient: attestation.recipient, timestamp: attestation.timestamp, data });
+      setReadiness("ready");
+      setReadinessMessage("The Primus attestation signature is valid.");
+    } catch (cause) {
+      setError(readableError(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyResult() {
+    if (!result) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(result, null, 2));
+      setCopied(true);
     } catch {
-      setError("Clipboard access failed. Open this application over HTTPS and try again.");
+      setError("Clipboard access was blocked. Copy the result directly from the displayed data.");
     }
   }
 
-  if (sharedPassport) {
-    return <SharedKycView passport={sharedPassport} />;
-  }
+  const dataText = result ? JSON.stringify(result.data, null, 2) : "";
 
   return (
-    <main className="page-shell">
-      <header className="topbar">
+    <main className="app-shell">
+      <nav className="topbar">
         <a className="brand" href="/">
           <span className="brand-mark">P</span>
-          <span>PRIMUS <b>OKX KYC</b></span>
+          <span>PRIMUS <b>OKX VERIFY</b></span>
         </a>
-        <span className="network-pill"><i /> ZK ID · OKX</span>
-      </header>
+        <a className="docs-link" href="https://docs.primuslabs.xyz/enterprise/zk-tls-sdk/overview" target="_blank" rel="noreferrer">
+          Primus docs <span>↗</span>
+        </a>
+      </nav>
 
       <section className="hero">
         <div className="hero-copy">
-          <p className="eyebrow"><span className="eyebrow-line" /> OKX ACCOUNT VERIFICATION</p>
-          <h1>Your KYC status.<br /><span>Proven with Primus.</span></h1>
-          <p className="hero-subtitle">
-            Create a verifiable OKX KYC credential using Primus zkTLS and BNB ZKID. The app displays the KYC level only after an on-chain attestation and a matching testnet registry read.
+          <div className="eyebrow"><span className="eyebrow-dot" /> PRIVATE DATA · PUBLIC PROOF</div>
+          <h1>Prove your OKX data.<br /><em>Keep control of it.</em></h1>
+          <p className="hero-description">
+            Generate a Primus zkTLS attestation from an approved OKX data template, then verify the attestor signature before reviewing the returned fields.
           </p>
-          <div className="hero-points">
-            <span><b>✓</b> Primus proof only</span>
-            <span><b>✓</b> KYC-level display</span>
-            <span><b>✓</b> Shareable proof reference</span>
+          <div className="hero-chips">
+            <span><i>✓</i> Primus zkTLS</span>
+            <span><i>✓</i> Server-side signing</span>
+            <span><i>✓</i> No BNB ZK ID</span>
           </div>
         </div>
-        <div className="hero-art" aria-hidden="true">
-          <div className="art-ring art-ring-one" />
-          <div className="art-ring art-ring-two" />
-          <div className="art-card">
-            <span className="art-spark">✳</span>
-            <span className="art-card-label">OKX KYC CREDENTIAL</span>
-            <div className="art-avatar">OKX</div>
-            <div className="art-lines"><i /><i /><i /></div>
-            <div className="art-proof"><span>✓</span> PRIMUS VERIFIED</div>
+        <div className="hero-visual" aria-hidden="true">
+          <div className="visual-orbit orbit-a" />
+          <div className="visual-orbit orbit-b" />
+          <div className="proof-card">
+            <div className="proof-card-top"><span className="proof-icon">✳</span><span>ATTESTATION / 001</span></div>
+            <div className="proof-card-title">OKX DATA<br /><strong>VERIFICATION</strong></div>
+            <div className="proof-card-rule" />
+            <div className="proof-card-bottom"><span className="proof-check">✓</span><span>PRIMUS SIGNATURE</span><b>VALID</b></div>
           </div>
-          <span className="float-chip chip-one">zkTLS</span>
-          <span className="float-chip chip-two">ZK ID</span>
+          <span className="orbit-tag tag-top">zkTLS</span>
+          <span className="orbit-tag tag-bottom">0 data uploaded</span>
         </div>
       </section>
 
-      <section className="workspace">
+      <section className="content">
         <div className="section-heading">
-          <div><p className="eyebrow">START HERE</p><h2>Verify your OKX account</h2></div>
-          <span className="step-count">01 / 03</span>
+          <div><span className="eyebrow">GET STARTED</span><h2>Create your attestation</h2></div>
+          <span className="step-indicator">01 <i>/</i> 03</span>
         </div>
 
-        <div className="flow-grid">
-          <article className="panel setup-panel">
-            <div className="panel-top">
-              <span className="panel-icon">01</span>
-              <div><h3>Connect your identity</h3><p>Connect a wallet address for the BNB ZKID proof request.</p></div>
-            </div>
+        <div className="setup-grid">
+          <article className="surface setup-card">
+            <div className="card-number">01</div>
+            <div className="card-heading"><h3>Identify your wallet</h3><p>Your address is used as the attestation recipient. No wallet signature or transaction is requested.</p></div>
             {walletAddress ? (
-              <div className="connected-wallet">
-                <span className="online-dot" />
-                <div><b>Wallet connected</b><small>{shortAddress(walletAddress)}</small></div>
-                <button className="text-button" onClick={() => setWalletAddress("")}>Disconnect</button>
+              <div className="wallet-connected">
+                <span className="live-dot" />
+                <div><b>Wallet address selected</b><small>{shortAddress(walletAddress)}</small></div>
+                <button className="text-action" onClick={() => setWalletAddress("")}>Clear</button>
               </div>
             ) : (
-              <button className="button button-secondary full-button" onClick={connectWallet}>Connect MetaMask <span>↗</span></button>
-            )}
-            <div className="hint-box">No seed phrase or private key is requested. The wallet address is used as the identity reference for Primus.</div>
-          </article>
-
-          <article className="panel setup-panel">
-            <div className="panel-top">
-              <span className="panel-icon">02</span>
-              <div><h3>Load Primus OKX property</h3><p>Read the live OKX identity property enabled for this app.</p></div>
-            </div>
-            <button className="button button-secondary full-button" onClick={loadOkxProperties} disabled={loadingProperties || running}>
-              {loadingProperties ? <><span className="spinner" /> Loading OKX property</> : "Discover OKX KYC property"}
-            </button>
-            {properties.length > 0 ? (
-              <div className="property-selector">
-                <label htmlFor="property">Primus OKX identity property</label>
-                <select id="property" value={selectedPropertyId} onChange={(event) => setSelectedPropertyId(event.target.value)}>
-                  {properties.map((property) => (
-                    <option key={property.identityPropertyId} value={property.identityPropertyId}>
-                      {property.description}
-                    </option>
-                  ))}
-                </select>
-                <small>Source: live Primus Gateway configuration</small>
-              </div>
-            ) : (
-              <div className="hint-box">The OKX property appears here only when the configured Primus App ID exposes it.</div>
-            )}
-          </article>
-        </div>
-
-        <article className="panel prove-panel">
-          <div className="prove-head">
-            <div className="panel-top">
-              <span className="panel-icon panel-icon-bright">03</span>
-              <div><h3>Generate your OKX KYC proof</h3><p>Sign in to OKX in this browser, enable the Primus extension, then run verification.</p></div>
-            </div>
-            <a className="extension-link" href={PRIMUS_EXTENSION_URL} target="_blank" rel="noreferrer">Primus extension ↗</a>
-          </div>
-          <div className="proof-warning">
-            <span>i</span>
-            <p>Complete sign-in only on the OKX page opened by Primus. Never enter your OKX password, API key, secret or verification code into this application.</p>
-          </div>
-          <div className="hint-box">
-            <b>Disclosure boundary:</b> Primus currently publishes one combined OKX identity property containing KYC level and six-month trade-history data. This app displays and shares only the KYC level. It is not a separate KYC-only proof template.
-          </div>
-          <button className="button button-primary full-button" onClick={runOkxProof} disabled={running || !walletAddress || !selectedProperty}>
-            {running ? <><span className="spinner spinner-dark" /> Verifying with Primus</> : "Verify OKX KYC with Primus"}
-            {!running && <span>→</span>}
-          </button>
-          <div className="status-block">
-            <div className="status-top"><span className="status-indicator" data-status={status} /> <b>{statusLabel(status)}</b>{running && <span className="status-live">LIVE</span>}</div>
-            <div className="progress-track"><i data-status={status} /></div>
-            <div className="status-steps">
-              <span className={["initializing","data_verifying","proof_generating","on_chain_attested"].includes(status) ? "active" : ""}>Initialize</span>
-              <span className={["data_verifying","proof_generating","on_chain_attested"].includes(status) ? "active" : ""}>zkTLS verify</span>
-              <span className={["proof_generating","on_chain_attested"].includes(status) ? "active" : ""}>ZK proof</span>
-              <span className={status === "on_chain_attested" ? "active" : ""}>Attested</span>
-            </div>
-          </div>
-        </article>
-
-        {error && <div className="alert alert-error"><b>Could not continue</b><span>{error}</span></div>}
-        {error && diagnostic && (
-          <div className="hint-box">
-            <b>Primus diagnostic details</b>
-            <small>Progress reached: {diagnostic.progress.join(" → ")}</small>
-            <small>Provider ID: {diagnostic.providerId}</small>
-            <small>Identity property ID: {diagnostic.identityPropertyId}</small>
-            <small>Client request ID: {diagnostic.sdkClientRequestId || diagnostic.clientRequestId}</small>
-            {diagnostic.errorCode && <small>SDK error code: {diagnostic.errorCode}</small>}
-            {diagnostic.proofRequestId && <small>Proof request ID: {diagnostic.proofRequestId}</small>}
-            {diagnostic.gatewayResponse && (
               <>
-                <small>Gateway HTTP status: {diagnostic.gatewayResponse.httpStatus}</small>
-                {diagnostic.gatewayResponse.responseStatus && <small>Gateway status: {diagnostic.gatewayResponse.responseStatus}</small>}
-                {diagnostic.gatewayResponse.errorCategory && <small>Gateway error category: {diagnostic.gatewayResponse.errorCategory}</small>}
-                {diagnostic.gatewayResponse.errorCode && <small>Gateway error code: {diagnostic.gatewayResponse.errorCode}</small>}
-                {diagnostic.gatewayResponse.errorMessage && <small>Gateway message: {diagnostic.gatewayResponse.errorMessage}</small>}
-                {diagnostic.gatewayResponse.proofRequestId && <small>Gateway proof request ID: {diagnostic.gatewayResponse.proofRequestId}</small>}
+                <button className="button button-outline" onClick={connectWallet}>Connect MetaMask <span>↗</span></button>
+                <div className="field-divider"><span>or enter an address</span></div>
+                <div className="manual-row">
+                  <input aria-label="EVM wallet address" value={manualAddress} onChange={(event) => setManualAddress(event.target.value)} placeholder="0x…" spellCheck={false} />
+                  <button className="button button-dark" onClick={useManualAddress}>Use address</button>
+                </div>
               </>
             )}
-          </div>
-        )}
+          </article>
 
-        {proof && proof.status === "on_chain_attested" && (
-          <section className="result-section">
-            <div className="section-heading">
-              <div><p className="eyebrow">PROOF COMPLETE</p><h2>Your OKX KYC credential</h2></div>
-              <span className="verified-tag large-tag">✓ PRIMUS ATTESTED</span>
+          <article className="surface setup-card">
+            <div className="card-number">02</div>
+            <div className="card-heading"><h3>Connect to Primus</h3><p>The browser extension runs the source verification flow. Your App Secret remains on the server.</p></div>
+            <div className={"readiness-panel " + readiness}>
+              <span className="readiness-symbol">{readiness === "ready" ? "✓" : readiness === "checking" ? "…" : "!"}</span>
+              <div><b>{readiness === "ready" ? "Primus is ready" : readiness === "checking" ? "Connecting" : "Action required"}</b><small>{readinessMessage}</small></div>
             </div>
-            <article className="panel result-panel">
-              <div className="result-summary">
-                <div className="result-icon">✓</div>
-                <div><h3>OKX identity proof</h3><p>Primus returned on-chain attestation for the OKX identity property.</p></div>
+            {readiness !== "ready" && (
+              <div className="readiness-actions">
+                <a href={PRIMUS_EXTENSION_URL} target="_blank" rel="noreferrer">Install Primus extension ↗</a>
+                <button className="text-action" onClick={retryInitialization}>Retry</button>
               </div>
-              <div className="result-data">
-                <div><small>PROPERTY</small><b>{proof.identityPropertyId}</b></div>
-                <div><small>PROVIDER</small><b>{proof.providerId}</b></div>
-                <div><small>PROOF REQUEST</small><b>{proof.proofRequestId || "Not returned"}</b></div>
-                <div><small>WALLET</small><b>{shortAddress(proof.walletAddress)}</b></div>
+            )}
+          </article>
+        </div>
+
+        <article className="surface attestation-panel">
+          <div className="attestation-header">
+            <div><div className="card-number">03</div><h3>Generate and verify</h3><p>Primus signs the request on the server, performs zkTLS in the browser, and returns a signed attestation.</p></div>
+            <span className="template-pill">TEMPLATE {TEMPLATE_ID ? "CONFIGURED" : "NOT SET"}</span>
+          </div>
+          <div className="template-summary">
+            <span className="template-icon">ID</span>
+            <div><b>Primus attestation template</b><small>{TEMPLATE_ID || "Set VITE_PRIMUS_TEMPLATE_ID after selecting the correct OKX template in Primus Developer Hub."}</small></div>
+          </div>
+          <button className="button button-primary" onClick={generateAttestation} disabled={busy || readiness !== "ready" || !walletAddress}>
+            {busy ? <><span className="spinner" /> Working with Primus…</> : <>Generate zkTLS attestation <span>→</span></>}
+          </button>
+          <div className="security-note"><span>i</span><p>Only use a template you trust and have reviewed. Never enter an OKX password, API key, one-time code, cookie, or wallet private key into this app.</p></div>
+        </article>
+
+        {error && <div className="alert alert-error"><b>Could not complete verification</b><span>{error}</span></div>}
+
+        {result && (
+          <section className="result-section">
+            <div className="result-heading">
+              <div><span className="eyebrow">RESULT</span><h2>Attestation verified</h2></div>
+              <span className="valid-pill"><i>✓</i> SIGNATURE VALID</span>
+            </div>
+            <article className="surface result-card">
+              <div className="result-meta">
+                <div><small>RECIPIENT</small><b>{shortAddress(result.recipient)}</b></div>
+                <div><small>ATTESTED</small><b>{timestampLabel(result.timestamp)}</b></div>
+                <div><small>TEMPLATE</small><b>{shortAddress(TEMPLATE_ID)}</b></div>
               </div>
-              {kyc ? (
-                <div className="decoded-profile">
-                  <p className="eyebrow">KYC LEVEL · PRIMUS REGISTRY DATA</p>
-                  <div className="profile-stats">
-                    <div><small>OKX KYC LEVEL</small><strong>{kyc.kycLevel}</strong></div>
-                  </div>
-                  <small className="registry-note">BNB Smart Chain testnet · registry timestamp {kyc.registryTimestamp}</small>
-                </div>
-              ) : (
-                <div className="hint-box">{kycWarning || "Primus attested the OKX property. The KYC level has not yet been decoded."}</div>
-              )}
-              <div className="share-controls">
-                <p className="eyebrow">SELECTIVE SHARING</p>
-                <label className="check-row">
-                  <input type="checkbox" checked={includeKyc} onChange={(event) => setIncludeKyc(event.target.checked)} disabled={!kyc} />
-                  <span><b>Include KYC level only</b><small>No trade-history figure is included in the shared page.</small></span>
-                </label>
-                <label className="check-row">
-                  <input type="checkbox" checked={includeWallet} onChange={(event) => setIncludeWallet(event.target.checked)} />
-                  <span><b>Include wallet address</b><small>Off by default; wallet addresses may be publicly linkable.</small></span>
-                </label>
-                <button className="button button-primary full-button" onClick={shareKycCredential} disabled={!proof.proofRequestId}>Copy shareable OKX KYC credential <span>↗</span></button>
-                {!proof.proofRequestId && <p className="share-warning">Primus did not return a proof reference, so independent sharing is disabled.</p>}
-                {shareMessage && <p className="share-success">{shareMessage}</p>}
-              </div>
-              <p className="fine-print">
-                Only the KYC level is displayed and placed in the share link. The Primus identity property itself remains the published composite KYC + six-month trade-history property.
+              <div className="data-heading"><div><h3>Verified template data</h3><p>Parsed from the signed Primus attestation.</p></div><button className="copy-button" onClick={copyResult}>{copied ? "Copied ✓" : "Copy JSON"}</button></div>
+              <pre className="data-output">{dataText}</pre>
+              <p className="claim-boundary">
+                <b>Important:</b> A valid Primus signature proves the attestation was signed by Primus. It does not by itself establish that this template proves OKX KYC. Confirm the template source, fields, and semantics in Primus Developer Hub before treating any field as a KYC result.
               </p>
             </article>
           </section>
@@ -699,9 +337,8 @@ export default function App() {
       </section>
 
       <footer className="footer">
-        <div className="brand"><span className="brand-mark">P</span><span>PRIMUS <b>OKX KYC</b></span></div>
-        <p>Proof first. KYC claim second.</p>
-        <small>Development build · BNB ZKID demo registry</small>
+        <a className="brand" href="/"><span className="brand-mark">P</span><span>PRIMUS <b>OKX VERIFY</b></span></a>
+        <span>Proof first. Claims only when supported.</span>
       </footer>
     </main>
   );
